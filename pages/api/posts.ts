@@ -1,5 +1,5 @@
 import { PAGINATE_LIMIT } from "consts";
-import { DurationMS, ErrorMessage, HttpRequest, ServerInfo } from "enums";
+import { DurationMS, ErrorMessage, Flag, HttpRequest, ServerInfo } from "enums";
 import {
   forwardResponse,
   handleAPIError,
@@ -26,7 +26,7 @@ export default async function handler(
     case HttpRequest.GET:
       res.setHeader(
         "Cache-Control",
-        `maxage=${5 * DurationMS.MIN}, must-revalidate`
+        `maxage=${DurationMS.MIN}, must-revalidate`
       );
       return handleGet(req, res);
     case HttpRequest.POST:
@@ -58,13 +58,19 @@ async function getPosts(params: Partial<IPostReq>): Promise<IResponse> {
 
   return new Promise(async (resolve, reject) => {
     const client = new RedisConnection();
-    let posts = await client.read(username, isPrivate, createdAt, limit);
+    let { data: posts, ETag } = await client.read(
+      username,
+      isPrivate,
+      createdAt,
+      limit
+    );
     if (posts?.length) {
       client.close();
       resolve({
         status: 200,
         message: ServerInfo.POST_RETRIEVED_CACHED,
         data: { posts },
+        ETag,
       });
     } else {
       const query: any = createdAt ? { createdAt: { $lt: createdAt } } : {};
@@ -87,6 +93,7 @@ async function getPosts(params: Partial<IPostReq>): Promise<IResponse> {
               ? ServerInfo.POST_RETRIEVED
               : ServerInfo.POST_NA,
             data: { posts },
+            ETag,
           });
         })
         .catch((err) => reject(new ServerError(500, err?.message)))
@@ -114,6 +121,7 @@ async function getPost(params: Partial<IPostReq>): Promise<IResponse> {
                 status: 200,
                 message: ServerInfo.POST_RETRIEVED,
                 data: { post },
+                ETag: post.id + post.updatedAt,
               });
             }
           });

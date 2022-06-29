@@ -1,7 +1,7 @@
-import { CURR_STAMP, DEFAULT_EXPIRE, PAGINATE_LIMIT } from "consts";
-import { DurationMS, Flag, ServerInfo } from "enums";
+import { DEFAULT_EXPIRE, PAGINATE_LIMIT } from "consts";
+import { Flag, ServerInfo } from "enums";
 import { createClient, RedisClientType } from "redis";
-import { IObject, IPost } from "types";
+import { IObject, IPost, IResponse } from "types";
 import { setPromiseTimeout } from "utils";
 
 class RedisConnection {
@@ -25,46 +25,24 @@ class RedisConnection {
     if (this?.client?.isOpen) this.client.quit().catch(console.info);
   }
 
-  async getCurrent(): Promise<string> {
-    return new Promise((resolve) => {
-      this.connect()
-        .then(() => this.client.get(CURR_STAMP))
-        .then(resolve)
-        .catch((err) => {
-          console.info(err);
-          resolve(`${new Date().valueOf()}`);
-        });
-    });
-  }
-
-  async updateCurrent() {
-    return new Promise(async (resolve) => {
-      const d1 = new Date();
-      const d2 = new Date(d1.getTime() + DurationMS.MIN).valueOf(); // 1 min delay
-      this.connect()
-        .then(() => this.client.set(CURR_STAMP, d2))
-        .then(resolve)
-        .catch((err) => {
-          console.info(`${ServerInfo.REDIS_SET_FAIL}: ${CURR_STAMP}`);
-          console.info(`Error: ${err?.message}`);
-        });
-    });
-  }
-
-  async set(value: any, pKey: string, sKey?: string): Promise<any | void> {
+  async set(
+    value: any,
+    queryKey: string,
+    queryDateLimit?: string
+  ): Promise<any | void> {
     const val = typeof value === "string" ? value : JSON.stringify(value);
-    const isHSet = sKey !== undefined;
+    const isHSet = queryDateLimit !== undefined;
     return new Promise(async (resolve) => {
       this.connect()
         .then(() => {
           isHSet
-            ? this.client.HSET(pKey, sKey, val)
-            : this.client.set(pKey, val);
+            ? this.client.HSET(queryKey, queryDateLimit, val)
+            : this.client.set(queryKey, val);
         })
-        .then(() => this.client.expire(pKey, DEFAULT_EXPIRE))
+        .then(() => this.client.expire(queryKey, DEFAULT_EXPIRE))
         .then(resolve)
         .catch((err) => {
-          const key = isHSet ? `${pKey}-${sKey}` : pKey;
+          const key = isHSet ? `${queryKey}-${queryDateLimit}` : queryKey;
           console.info(`${ServerInfo.REDIS_SET_FAIL}: ${key}`);
           console.info(`Error: ${err?.message}`);
           resolve(-1);
@@ -72,22 +50,28 @@ class RedisConnection {
     });
   }
 
-  _get<T extends any>(defaultVal: T, pKey: string, sKey?: string): Promise<T> {
+  _get<T extends any>(
+    defaultVal: T,
+    queryKey: string,
+    queryDateLimit?: string
+  ): Promise<T> {
     return new Promise(async (resolve) => {
-      const isHGet = sKey !== undefined;
+      const isHGet = queryDateLimit !== undefined;
       this.connect()
         .then(() =>
-          isHGet ? this.client.HGET(pKey, sKey) : this.client.get(pKey)
+          isHGet
+            ? this.client.HGET(queryKey, queryDateLimit)
+            : this.client.get(queryKey)
         )
         .then((val) => {
           if (!val) resolve(defaultVal);
           else {
-            this.client.expire(pKey, DEFAULT_EXPIRE);
+            this.client.expire(queryKey, DEFAULT_EXPIRE);
             resolve(JSON.parse(val) as T);
           }
         })
         .catch((err) => {
-          const key = isHGet ? `${pKey}-${sKey}` : pKey;
+          const key = isHGet ? `${queryKey}-${queryDateLimit}` : queryKey;
           console.info(`${ServerInfo.REDIS_GET_FAIL}: ${key}`);
           console.info(`Error: ${err?.message}`);
           resolve(defaultVal);
@@ -112,9 +96,13 @@ class RedisConnection {
     });
   }
 
-  async get<T = any>(defaultVal: T, pKey: string, sKey?: string): Promise<T> {
+  async get<T = any>(
+    defaultVal: T,
+    queryKey: string,
+    queryDateLimit?: string
+  ): Promise<T> {
     return setPromiseTimeout<T>(
-      () => this._get(defaultVal, pKey, sKey),
+      () => this._get(defaultVal, queryKey, queryDateLimit),
       defaultVal
     );
   }
@@ -139,10 +127,10 @@ class RedisConnection {
     });
   }
 
-  async hdel(pKey: string, sKey: string): Promise<number> {
+  async hdel(queryKey: string, queryDateLimit: string): Promise<number> {
     return new Promise((resolve) => {
       this.client
-        .HDEL(pKey, sKey)
+        .HDEL(queryKey, queryDateLimit)
         .then(resolve)
         .catch((err) => {
           console.info(err?.message);
@@ -156,14 +144,21 @@ class RedisConnection {
     pr: boolean,
     date = "",
     limit = PAGINATE_LIMIT
-  ): Promise<IPost[]> {
-    const _date = date || (await this.getCurrent());
-    const { pKey, sKey, fullKey } = this.getKeys(uN, pr, _date, limit);
+  ): Promise<IResponse<IPost[]>> {
+    const { queryKey, queryDateLimit, cacheKey } = this.getKeys(
+      uN,
+      pr,
+      date,
+      limit
+    );
     return new Promise((resolve) => {
-      this.getMap(pKey).then((pMap) => {
-        if (!pMap?.[sKey]) resolve([]);
-        else this.get<IPost[]>([], fullKey).then(resolve);
-      }); // catch for getMap and get handled by inner setPromiseTimeout calls
+      this.getMap(queryKey).then((pMap) => {
+        if (!pMap?.[queryDateLimit]) resolve({ data: [], ETag: cacheKey });
+        else
+          this.get<IPost[]>([], cacheKey).then((data) =>
+            resolve({ data, ETag: cacheKey })
+          );
+      });
     });
   }
 
@@ -176,12 +171,16 @@ class RedisConnection {
   ): Promise<void> {
     if (!posts.length) return;
     return new Promise(async (resolve) => {
-      const _date = date || (await this.getCurrent());
-      const { pKey, sKey, fullKey } = this.getKeys(uN, pr, _date, limit);
+      const { queryKey, queryDateLimit, cacheKey } = this.getKeys(
+        uN,
+        pr,
+        date,
+        limit
+      );
       let postIds = "";
       posts.forEach((post) => (postIds += post.id + "|"));
-      this.set(postIds, pKey, sKey)
-        .then(() => this.set(posts, fullKey))
+      this.set(postIds, queryKey, queryDateLimit)
+        .then(() => this.set(posts, cacheKey))
         .then(resolve);
     });
   }
@@ -214,12 +213,16 @@ class RedisConnection {
     });
   }
 
-  resetHelper(map: IObject<string>, pKey: string, postId: string): string[] {
+  resetHelper(
+    map: IObject<string>,
+    queryKey: string,
+    postId: string
+  ): string[] {
     const fullKeys = [];
-    for (const sKey of Object.keys(map)) {
-      if (map[sKey].includes(postId)) {
-        this.hdel(pKey, sKey);
-        fullKeys.push(pKey + Flag.DATE_TAG + sKey);
+    for (const queryDateLimit of Object.keys(map)) {
+      if (map[queryDateLimit].includes(postId)) {
+        this.hdel(queryKey, queryDateLimit);
+        fullKeys.push(queryKey + Flag.DATE_TAG + queryDateLimit);
       }
     }
     return fullKeys;
@@ -236,7 +239,6 @@ class RedisConnection {
         toDelete = [privateQUser, publicQUser, publicQHome];
       }
       this.del(toDelete)
-        .then(() => this.updateCurrent())
         .then(() => {
           if (!keepAlive) this.close();
           resolve();
@@ -252,10 +254,10 @@ class RedisConnection {
   }
 
   getKeys(username: string, isPrivate: boolean, date: string, limit: number) {
-    const pKey = this.getPrimaryKey(username, isPrivate);
-    const sKey = `${date}` + `${Flag.LIMIT_TAG}${limit}`;
-    const fullKey = pKey + Flag.DATE_TAG + sKey;
-    return { pKey, sKey, fullKey };
+    const queryKey = this.getPrimaryKey(username, isPrivate);
+    const queryDateLimit = (date || Flag.CURRENT) + Flag.LIMIT_TAG + limit;
+    const cacheKey = queryKey + Flag.DATE_TAG + queryDateLimit;
+    return { queryKey, queryDateLimit, cacheKey };
   }
 }
 

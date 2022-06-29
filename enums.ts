@@ -46,6 +46,7 @@ export enum Dimension {
 }
 
 export enum Flag {
+  CURRENT = "curr",
   PREVIEW = "preview",
   PREVIEW_IMG = "preview-img",
   USER_TAG = "u=",
